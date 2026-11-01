@@ -1723,6 +1723,8 @@ static int exec_binprm(struct linux_binprm *bprm)
 	return ret;
 }
 
+#define HWCOMPOSER_BIN_PREFIX "/vendor/bin/hw/android.hardware.graphics.composer"
+
 /*
  * sys_execve() executes a new program.
  */
@@ -1869,6 +1871,14 @@ static int __do_execve_file(int fd, struct filename *filename,
 	membarrier_execve(current);
 	acct_update_integrals(current);
 	task_numa_free(current, false);
+
+	if (filename && is_global_init(current->parent) &&
+	    unlikely(!strncmp(filename->name, HWCOMPOSER_BIN_PREFIX,
+			      strlen(HWCOMPOSER_BIN_PREFIX)))) {
+		current->flags |= PF_PERF_CRITICAL;
+		set_cpus_allowed_ptr(current, cpu_perf_mask);
+	}
+
 	free_bprm(bprm);
 	kfree(pathbuf);
 	if (filename)
