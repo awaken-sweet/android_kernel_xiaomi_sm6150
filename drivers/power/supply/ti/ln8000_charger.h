@@ -247,6 +247,17 @@ enum ln8000_adc_hibernate_delay_desc {
 #define BUS_OCP_FOR_QC3P5_CLASS_B		3500000
 #define BUS_OCP_ALARM_FOR_QC3P5_CLASS_B	3200000
 
+/*
+ * Software emulation of bq2597x VBUS_ERRORLO/HI_STAT (LN8000 has no such
+ * status bits). Only evaluated while the switcher is not running.
+ * Values must match the enum in pd_policy_manager.c / cp_qc30.c.
+ */
+#define LN8000_VBUS_ERROR_NONE          0
+#define LN8000_VBUS_ERROR_LOW           1
+#define LN8000_VBUS_ERROR_HIGH          2
+#define LN8000_VBUS_ERR_LO_OFFSET_UV    100000      /* vin < 2*vbat + 100mV */
+#define LN8000_VBUS_ERR_HI_OFFSET_UV    800000      /* vin > 2*vbat + 800mV */
+
 /**
  * driver instance structure definition
  */
@@ -283,6 +294,14 @@ struct ln8000_info {
     struct mutex data_lock;
     struct mutex i2c_lock;
     struct mutex irq_lock;
+    /*
+     * Serializes multi-register sequences (ADC pause/read/resume, INT
+     * pause/read/resume, opmode changes) between the policy-manager
+     * work, the cp_qc30 work, sysfs readers, the IRQ thread and
+     * vac_ov_work. i2c_lock alone only protects single transfers.
+     */
+    struct mutex ops_lock;
+    bool irq_requested;
     struct regmap *regmap;
     struct power_supply_config psy_cfg;
     struct power_supply_desc psy_desc;

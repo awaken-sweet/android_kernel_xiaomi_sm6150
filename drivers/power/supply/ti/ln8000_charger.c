@@ -565,7 +565,8 @@ static int ln8000_check_status(struct ln8000_info *info)
 
 static void ln8000_irq_sleep(struct ln8000_info *info, int suspend)
 {
-    if (info->client->irq <= 0)
+    /* never touch an IRQ line we have not requested ourselves */
+    if (info->client->irq <= 0 || !info->irq_requested)
        return;
 
     if (suspend) {
@@ -776,6 +777,31 @@ static int psy_chg_get_charging_enabled(struct ln8000_info *info)
     return enabled;
 }
 
+/*
+ * Emulate bq2597x VBUS_ERROR_LO/HI so the K6 (CONFIG_K6_CHARGE) paths in
+ * pd_policy_manager / cp_qc30 can step the adapter *down* as well as up.
+ * Without this the property returned -EINVAL and "too high" was never seen.
+ */
+static int psy_chg_get_bus_error_status(struct ln8000_info *info)
+{
+    int vbus, vbat;
+
+    ln8000_update_opmode(info);
+    if (info->op_mode >= LN8000_OPMODE_BYPASS)
+        return LN8000_VBUS_ERROR_NONE;  /* only meaningful before start-up */
+
+    if (ln8000_get_adc_data(info, LN8000_ADC_CH_VIN, &vbus) < 0 ||
+        ln8000_get_adc_data(info, LN8000_ADC_CH_VBAT, &vbat) < 0)
+        return LN8000_VBUS_ERROR_NONE;
+
+    if (vbus < (vbat * 2) + LN8000_VBUS_ERR_LO_OFFSET_UV)
+        return LN8000_VBUS_ERROR_LOW;
+    if (vbus > (vbat * 2) + LN8000_VBUS_ERR_HI_OFFSET_UV)
+        return LN8000_VBUS_ERROR_HIGH;
+
+    return LN8000_VBUS_ERROR_NONE;
+}
+
 static int psy_chg_get_ti_alarm_status(struct ln8000_info *info)
 {
     int alarm;
@@ -868,10 +894,15 @@ static int ln8000_charger_get_property(struct power_supply *psy,
                                        union power_supply_propval *val)
 {
     struct ln8000_info *info = power_supply_get_drvdata(psy);
+    int ret = 0;
 
+    mutex_lock(&info->ops_lock);
     switch (prop) {
     case POWER_SUPPLY_PROP_CHARGING_ENABLED:
         val->intval = psy_chg_get_charging_enabled(info);
+        break;
+    case POWER_SUPPLY_PROP_TI_BUS_ERROR_STATUS:
+        val->intval = psy_chg_get_bus_error_status(info);
         break;
     case POWER_SUPPLY_PROP_STATUS:
         val->intval = 0;
@@ -955,10 +986,12 @@ static int ln8000_charger_get_property(struct power_supply *psy,
         val->strval = "ln8000";
         break;
     default:
-        return -EINVAL;
+        ret = -EINVAL;
+        break;
     }
+    mutex_unlock(&info->ops_lock);
 
-    return 0;
+    return ret;
 }
 
 static int psy_chg_set_charging_enable(struct ln8000_info *info, int val)
@@ -1046,6 +1079,7 @@ static int ln8000_charger_set_property(struct power_supply *psy,
     struct ln8000_info *info = power_supply_get_drvdata(psy);
     int ret = 0;
 
+    mutex_lock(&info->ops_lock);
     switch (prop) {
     case POWER_SUPPLY_PROP_CHARGING_ENABLED:
         ret = psy_chg_set_charging_enable(info, val->intval);
@@ -1066,6 +1100,7 @@ static int ln8000_charger_set_property(struct power_supply *psy,
         ret = -EINVAL;
         break;
     }
+    mutex_unlock(&info->ops_lock);
 
     return ret;
 }
@@ -1110,6 +1145,7 @@ static enum power_supply_property ln8000_charger_props[] = {
     POWER_SUPPLY_PROP_TI_FAULT_STATUS,
     POWER_SUPPLY_PROP_TI_REG_STATUS,
     POWER_SUPPLY_PROP_TI_SET_BUS_PROTECTION_FOR_QC3,
+    POWER_SUPPLY_PROP_TI_BUS_ERROR_STATUS,
     POWER_SUPPLY_PROP_MODEL_NAME,
 };
 
@@ -1198,8 +1234,10 @@ static void vac_ov_control_work(struct work_struct *work)
     ta_detached = 0;
     cnt = 5000 / delay;
     for (i = 0; i < cnt; ++i) {
+        mutex_lock(&info->ops_lock);
         ln8000_get_adc_data(info, LN8000_ADC_CH_VIN, &info->vbus_uV);
         ln8000_read_reg(info, LN8000_REG_SYS_STS, &sys_st);
+        mutex_unlock(&info->ops_lock);
 
         if (enable_vac_ov) {
             /* Check ADC_VIN during the 5sec, if vin higher then 10V, disable to vac_ov */
@@ -1249,13 +1287,12 @@ static void check_vac_ov_work(struct ln8000_info *info)
     }
 }
 
-static irqreturn_t ln8000_interrupt_handler(int irq, void *data)
+static irqreturn_t __ln8000_interrupt_handler(struct ln8000_info *info)
 {
-    struct ln8000_info *info = data;
     u32 int_reg, int_msk;
     u8 masked_int;
     int ret;
-    ln_err("ln8000_interrupt_handler enter!\n");
+
     ret = ln8000_read_int_value(info, &int_reg);
     if (IS_ERR_VALUE((unsigned long)ret)) {
         ln_err("fail to read INT reg (ret=%d)\n", ret);
@@ -1325,6 +1362,18 @@ static irqreturn_t ln8000_interrupt_handler(int irq, void *data)
     check_vac_ov_work(info);
 
     return IRQ_HANDLED;
+}
+
+static irqreturn_t ln8000_interrupt_handler(int irq, void *data)
+{
+    struct ln8000_info *info = data;
+    irqreturn_t ret;
+
+    mutex_lock(&info->ops_lock);
+    ret = __ln8000_interrupt_handler(info);
+    mutex_unlock(&info->ops_lock);
+
+    return ret;
 }
 
 static int ln8000_irq_init(struct ln8000_info *info)
@@ -1444,7 +1493,7 @@ static int ln8000_get_dev_role(struct i2c_client *client)
 
     dev_info(&client->dev,"%s: matched to %s\n", __func__, of_id->compatible);
 
-    return (int)of_id->data;
+    return (int)(uintptr_t)of_id->data;
 }
 
 static int ln8000_parse_dt(struct ln8000_info *info)
@@ -1564,109 +1613,104 @@ static int ln8000_probe(struct i2c_client *client, const struct i2c_device_id *i
         return -ENOMEM;
     }
 
-	info->dev = &client->dev;
-	info->client = client;
+    info->dev = &client->dev;
+    info->client = client;
 
-	/* detect device on connected i2c bus */
-	ret = i2c_smbus_read_byte_data(client, LN8000_REG_DEVICE_ID);
-	if (IS_ERR_VALUE((unsigned long)ret)) {
-		ret = try_to_find_i2c_regess(info);
-		if (ret != 0x42) {
-			dev_err(&client->dev, "fail to detect ln8000 on i2c_bus(addr=0x%x)\n", client->addr);
-			return -ENODEV;
-		}
-	}
-	dev_info(&client->dev, "device id=0x%x\n", ret);
+    /*
+     * Locks must exist before the first register access:
+     * try_to_find_i2c_regess() -> ln8000_soft_reset() already uses i2c_lock.
+     */
+    mutex_init(&info->data_lock);
+    mutex_init(&info->i2c_lock);
+    mutex_init(&info->irq_lock);
+    mutex_init(&info->ops_lock);
+    INIT_DELAYED_WORK(&info->vac_ov_work, vac_ov_control_work);
 
-    info->dev_role = ln8000_get_dev_role(client);
-    if (IS_ERR_VALUE((unsigned long)info->dev_role)) {
-        kfree(info);
-        return -EINVAL;
+    /* detect device on connected i2c bus */
+    ret = i2c_smbus_read_byte_data(client, LN8000_REG_DEVICE_ID);
+    if (IS_ERR_VALUE((unsigned long)ret)) {
+        ret = try_to_find_i2c_regess(info);
     }
+    if (ret != LN8000_DEVICE_ID) {
+        dev_err(&client->dev, "fail to detect ln8000 on i2c_bus(addr=0x%x, id=0x%x)\n",
+                client->addr, ret);
+        ret = -ENODEV;
+        goto err_mutex;
+    }
+    dev_info(&client->dev, "device id=0x%x\n", ret);
+
+    ret = ln8000_get_dev_role(client);
+    if (ret < 0)
+        goto err_mutex;
+    info->dev_role = ret;
 
     info->pdata = devm_kzalloc(&client->dev, sizeof(struct ln8000_platform_data), GFP_KERNEL);
     if (info->pdata == NULL) {
        ln_err("fail to alloc devm for ln8000_platform_data\n");
-       kfree(info);
-       return -ENOMEM;
+       ret = -ENOMEM;
+       goto err_mutex;
     }
 
     ret = ln8000_parse_dt(info);
     if (IS_ERR_VALUE((unsigned long)ret)) {
         ln_err("fail to parsed dt\n");
-        goto err_devmem;
+        goto err_mutex;
     }
 
     info->regmap = devm_regmap_init_i2c(client, &ln8000_regmap_config);
     if (IS_ERR(info->regmap)) {
        ln_err("fail to initialize regmap\n");
        ret = PTR_ERR(info->regmap);
-       goto err_devmem;
+       goto err_gpio;
     }
 
-    mutex_init(&info->data_lock);
-    mutex_init(&info->i2c_lock);
-    mutex_init(&info->irq_lock);
     i2c_set_clientdata(client, info);
 
     ln8000_soft_reset(info);
     ln8000_init_device(info);
 
     ret = ln8000_psy_register(info);
-    if (ret) {
-       goto err_cleanup;
-    }
+    if (ret)
+       goto err_gpio;
 
     ret = ln8000_irq_init(info);
-    if (ret < 0) {
-      goto err_psy;
-    }
+    if (ret < 0)
+       goto err_gpio;
 
     if (client->irq) {
-		ret = devm_request_threaded_irq(&client->dev, client->irq,
-				NULL, ln8000_interrupt_handler,
-				IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
-				"ln8000-charger-irq", info);
-		if (ret < 0) {
-			ln_err("request irq for irq=%d failed, ret =%d\n",
-							client->irq, ret);
-            goto err_wakeup;
-		}
-		enable_irq_wake(client->irq);
-        INIT_DELAYED_WORK(&info->vac_ov_work, vac_ov_control_work);
-	} else {
+        ret = devm_request_threaded_irq(&client->dev, client->irq,
+                NULL, ln8000_interrupt_handler,
+                IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+                "ln8000-charger-irq", info);
+        if (ret < 0) {
+            ln_err("request irq for irq=%d failed, ret =%d\n", client->irq, ret);
+            goto err_gpio;
+        }
+        info->irq_requested = true;
+    } else {
         ln_info("don't support isr(irq=%d)\n", info->client->irq);
     }
 
     device_init_wakeup(info->dev, 1);
 
-    ret = ln8000_create_debugfs_entries(info);
-    if (IS_ERR_VALUE((unsigned long)ret)) {
-       goto err_wakeup;
-    }
+    /* debugfs is optional, never fail probe on it */
+    if (ln8000_create_debugfs_entries(info))
+        ln_err("debugfs unavailable\n");
 
     determine_initial_status(info);
 
     return 0;
 
-err_wakeup:
-    if (LN8000_IS_PRIMARY(info) && client->irq) {
-       free_irq(client->irq, info);
-       if (info->pdata->irq_gpio) {
-           gpiod_put(info->pdata->irq_gpio);
-       }
-    }
-err_psy:
-    power_supply_unregister(info->psy_chg);
-
-err_cleanup:
+err_gpio:
+    if (info->pdata && !IS_ERR_OR_NULL(info->pdata->irq_gpio))
+        gpiod_put(info->pdata->irq_gpio);
     i2c_set_clientdata(client, NULL);
+err_mutex:
+    /* info, pdata, regmap, psy and irq are devm-managed: do NOT free them here */
+    mutex_destroy(&info->ops_lock);
     mutex_destroy(&info->data_lock);
     mutex_destroy(&info->i2c_lock);
     mutex_destroy(&info->irq_lock);
-err_devmem:
-    kfree(info->pdata);
-    kfree(info);
 
     return ret;
 }
@@ -1675,27 +1719,28 @@ static int ln8000_remove(struct i2c_client *client)
 {
     struct ln8000_info *info = i2c_get_clientdata(client);
 
+    if (info->irq_requested) {
+        devm_free_irq(&client->dev, client->irq, info);
+        info->irq_requested = false;
+    }
+    cancel_delayed_work_sync(&info->vac_ov_work);
+
     ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
 
     debugfs_remove_recursive(info->debug_root);
 
-    if (LN8000_IS_PRIMARY(info) && client->irq) {
-       free_irq(client->irq, info);
-       if (info->pdata->irq_gpio) {
-           gpiod_put(info->pdata->irq_gpio);
-       }
-    }
+    if (!IS_ERR_OR_NULL(info->pdata->irq_gpio))
+        gpiod_put(info->pdata->irq_gpio);
 
-    power_supply_unregister(info->psy_chg);
+    device_init_wakeup(info->dev, 0);
     i2c_set_clientdata(info->client, NULL);
 
+    mutex_destroy(&info->ops_lock);
     mutex_destroy(&info->data_lock);
     mutex_destroy(&info->i2c_lock);
     mutex_destroy(&info->irq_lock);
 
-    kfree(info->pdata);
-    kfree(info);
-
+    /* psy, info, pdata: released by devres */
     return 0;
 }
 
@@ -1711,7 +1756,7 @@ static int ln8000_suspend(struct device *dev)
 {
     struct ln8000_info *info = dev_get_drvdata(dev);
 
-    if (device_may_wakeup(dev) && info->client->irq)
+    if (device_may_wakeup(dev) && info->irq_requested)
         enable_irq_wake(info->client->irq);
 
     ln8000_irq_sleep(info, 1);
@@ -1723,7 +1768,7 @@ static int ln8000_resume(struct device *dev)
 {
     struct ln8000_info *info = dev_get_drvdata(dev);
 
-    if (device_may_wakeup(dev) && info->client->irq)
+    if (device_may_wakeup(dev) && info->irq_requested)
         disable_irq_wake(info->client->irq);
 
     ln8000_irq_sleep(info, 0);
