@@ -219,14 +219,16 @@ And public attribution of xiaomi platforms(like F3 and so and)
 	ln8000_charger@51 {
 		compatible = "lionsemi,ln8000";
 		reg = <0x51>;
-		/* bank <bit-idx> <flags: active-low> */
-		//irq-gpios = <&tlmm 55 0x2002>;
-
-                //interrupt-parent = <&tlmm>;
-                //interrupts = <55 0x2002>;
-                //pinctrl-names = "default";
-                //pinctrl-0 = <&bq2597x_int_default &bq2597x_int_suspend>;
-		ln8000_charger,irq_index = <296>;
+		/*
+		 * LN8000 shares the bq25970 footprint on K6/K6A, so its INT pin is
+		 * the same TLMM GPIO55. The old "irq_index = <296>" was a raw Linux
+		 * virq number copied from nabu; virq numbering is not stable across
+		 * SoCs/kernels, so it is not guaranteed to be GPIO55 on sweet.
+		 */
+		interrupt-parent = <&tlmm>;
+		interrupts = <55 0x2002>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&bq2597x_int_default &bq2597x_int_suspend>;
 		/* device configuration */
 		ln8000_charger,bat-ovp-threshold = <4560>;
 		ln8000_charger,bat-ovp-alarm-threshold = <4525>;
